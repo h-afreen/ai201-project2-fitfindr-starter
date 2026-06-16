@@ -18,7 +18,76 @@ Usage (once implemented):
     print(result["error"])   # None on success
 """
 
-from tools import search_listings, suggest_outfit, create_fit_card
+import json
+
+from tools import (
+    search_listings,
+    suggest_outfit,
+    create_fit_card,
+    _get_groq_client,
+    MODEL,
+)
+
+
+# ── query parsing (Groq tool-calling) ───────────────────────────────────────────
+
+# Function schema the LLM is forced to call. Groq returns the arguments as
+# validated JSON, which is more reliable than parsing free-text.
+_PARSE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "extract_search_params",
+        "description": "Extract structured secondhand-clothing search parameters from a shopper's query.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "description": {
+                    "type": "string",
+                    "description": "Core item keywords only (no size or price), e.g. 'vintage graphic tee'.",
+                },
+                "size": {
+                    "type": ["string", "null"],
+                    "description": "Requested size if mentioned (e.g. 'M', '8'), else null.",
+                },
+                "max_price": {
+                    "type": ["number", "null"],
+                    "description": "Maximum price if mentioned (e.g. 30), else null.",
+                },
+            },
+            "required": ["description"],
+        },
+    },
+}
+
+
+def _parse_query(query: str) -> dict:
+    """
+    Parse a natural-language query into {description, size, max_price} using Groq
+    tool-calling. Falls back to using the whole query as the description (with no
+    filters) if the LLM omits the call or returns malformed arguments.
+    """
+    try:
+        client = _get_groq_client()
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "user", "content": query}],
+            tools=[_PARSE_TOOL],
+            tool_choice={
+                "type": "function",
+                "function": {"name": "extract_search_params"},
+            },
+            temperature=0,
+        )
+        args = response.choices[0].message.tool_calls[0].function.arguments
+        parsed = json.loads(args)
+        return {
+            "description": parsed.get("description") or query,
+            "size": parsed.get("size"),
+            "max_price": parsed.get("max_price"),
+        }
+    except Exception:
+        # Fallback: no structured parse available — search on the raw query.
+        return {"description": query, "size": None, "max_price": None}
 
 
 # ── session state ─────────────────────────────────────────────────────────────
@@ -92,9 +161,40 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     Before writing code, complete the Planning Loop and State Management sections
     of planning.md — your implementation should match what you described there.
     """
-    # TODO: implement the planning loop
+    # Step 1: initialize session state.
     session = _new_session(query, wardrobe)
-    session["error"] = "Planning loop not yet implemented."
+
+    # Step 2: parse the query into description / size / max_price.
+    session["parsed"] = _parse_query(query)
+
+    # Step 3: search listings with the parsed params.
+    session["search_results"] = search_listings(
+        session["parsed"]["description"],
+        size=session["parsed"]["size"],
+        max_price=session["parsed"]["max_price"],
+    )
+    if not session["search_results"]:
+        # No-results branch: stop early, do not call suggest_outfit.
+        session["error"] = (
+            "No listings matched your search. Try broadening your description "
+            "or raising your price limit."
+        )
+        return session
+
+    # Step 4: select the top-ranked listing.
+    session["selected_item"] = session["search_results"][0]
+
+    # Step 5: suggest an outfit using the selected item + wardrobe.
+    session["outfit_suggestion"] = suggest_outfit(
+        session["selected_item"], session["wardrobe"]
+    )
+
+    # Step 6: turn the outfit into a shareable fit card.
+    session["fit_card"] = create_fit_card(
+        session["outfit_suggestion"], session["selected_item"]
+    )
+
+    # Step 7: return the completed session.
     return session
 
 
